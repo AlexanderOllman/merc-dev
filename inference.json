@@ -1,0 +1,383 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Model Inference on First Image in Dataset\n",
+    "\n",
+    "This file contains code to load the converted BLIP2 model from MLflow and perform inference on the first image in the dataset."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import mlflow\n",
+    "from mlflow.tracking import MlflowClient\n",
+    "import torch\n",
+    "import boto3\n",
+    "import json\n",
+    "import numpy as np\n",
+    "from PIL import Image\n",
+    "from io import BytesIO\n",
+    "import matplotlib.pyplot as plt\n",
+    "from torchvision import transforms\n",
+    "\n",
+    "# Set device\n",
+    "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "print(f\"Using device: {device}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Connect to S3 to access the dataset"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Configure S3 connection\n",
+    "object_storage_service_name = \"source-images-service\"\n",
+    "object_storage_namespace = \".ezdata-system\"\n",
+    "resource_type = \".svc\"\n",
+    "domain = \".cluster.local\"\n",
+    "object_storage_port = \"30000\"\n",
+    "\n",
+    "s3_endpoint_url = f\"http://{object_storage_service_name}{object_storage_namespace}{resource_type}{domain}:{object_storage_port}\"\n",
+    "print(f\"S3 endpoint URL: {s3_endpoint_url}\")\n",
+    "\n",
+    "# Create S3 clients\n",
+    "s3_client = boto3.client('s3', endpoint_url=s3_endpoint_url)\n",
+    "s3_resource = boto3.resource('s3', endpoint_url=s3_endpoint_url)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Load the dataset information"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Set bucket name\n",
+    "bucket_name = \"poc-mercedes-gp\"\n",
+    "\n",
+    "# Load the dataset JSON file\n",
+    "file_key = \"training/training_dataset.json\"\n",
+    "response = s3_client.get_object(Bucket=bucket_name, Key=file_key)\n",
+    "content = response[\"Body\"].read().decode(\"utf-8\")\n",
+    "dataset = json.loads(content)\n",
+    "\n",
+    "# Display information about the first image in the dataset\n",
+    "print(\"First image information:\")\n",
+    "print(dataset[0])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Download and display the first image"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Get the S3 key for the first image\n",
+    "first_image_key = dataset[0]['s3_key']\n",
+    "print(f\"First image S3 key: {first_image_key}\")\n",
+    "\n",
+    "# Download the image\n",
+    "response = s3_client.get_object(Bucket=bucket_name, Key=first_image_key)\n",
+    "image_data = response['Body'].read()\n",
+    "\n",
+    "# Convert to PIL Image\n",
+    "image = Image.open(BytesIO(image_data))\n",
+    "\n",
+    "# Display the image\n",
+    "plt.figure(figsize=(10, 10))\n",
+    "plt.imshow(image)\n",
+    "plt.axis('off')\n",
+    "plt.title(f\"Image: {first_image_key.split('/')[-1]}\\nGround Truth: {dataset[0]['text']}\")\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Load the converted model from MLflow"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Refresh token if needed\n",
+    "%update_token\n",
+    "\n",
+    "# Get the latest version of the registered model\n",
+    "client = MlflowClient()\n",
+    "registered_model_name = \"blip_ft_production\"\n",
+    "\n",
+    "# Get the latest version\n",
+    "latest_versions = client.get_latest_versions(registered_model_name)\n",
+    "latest_version = None\n",
+    "for version in latest_versions:\n",
+    "    if version.current_stage == \"Production\":\n",
+    "        latest_version = version\n",
+    "        break\n",
+    "    \n",
+    "if latest_version is None and len(latest_versions) > 0:\n",
+    "    latest_version = latest_versions[0]\n",
+    "\n",
+    "if latest_version is None:\n",
+    "    raise ValueError(f\"No versions found for model {registered_model_name}\")\n",
+    "\n",
+    "print(f\"Using model version: {latest_version.version}, stage: {latest_version.current_stage}\")\n",
+    "\n",
+    "# Get the model's artifact URI\n",
+    "model_uri = f\"models:/{registered_model_name}/{latest_version.version}\"\n",
+    "print(f\"Model URI: {model_uri}\")\n",
+    "\n",
+    "# Load the model as a PyTorch model\n",
+    "scripted_model = mlflow.pytorch.load_model(model_uri, map_location=device)\n",
+    "print(\"Model loaded successfully\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Preprocess the image manually (without LAVIS)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Define a custom preprocessing function based on standard BLIP2 preprocessing\n",
+    "def preprocess_image(image, size=224):\n",
+    "    # BLIP2 standard preprocessing\n",
+    "    transform = transforms.Compose([\n",
+    "        transforms.Resize((size, size)),\n",
+    "        transforms.ToTensor(),\n",
+    "        transforms.Normalize((0.48145466, 0.4578275, 0.40821073), \n",
+    "                             (0.26862954, 0.26130258, 0.27577711))\n",
+    "    ])\n",
+    "    \n",
+    "    # Convert to RGB if it's not already\n",
+    "    if image.mode != \"RGB\":\n",
+    "        image = image.convert(\"RGB\")\n",
+    "        \n",
+    "    # Apply transformations\n",
+    "    tensor = transform(image).unsqueeze(0)  # Add batch dimension\n",
+    "    return tensor\n",
+    "\n",
+    "# Preprocess the image\n",
+    "processed_image = preprocess_image(image).to(device)\n",
+    "print(f\"Processed image shape: {processed_image.shape}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Run inference with the model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Set model to evaluation mode\n",
+    "scripted_model.eval()\n",
+    "\n",
+    "# Run inference\n",
+    "with torch.no_grad():\n",
+    "    features = scripted_model(processed_image)\n",
+    "    \n",
+    "print(f\"Output features shape: {features.shape}\")\n",
+    "\n",
+    "# Displaying the first few features\n",
+    "print(\"\\nFirst 10 feature values:\")\n",
+    "print(features[0, :10].cpu().numpy())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Visualize Feature Map\n",
+    "\n",
+    "Let's visualize a projection of the feature vectors to better understand what the model has extracted."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from sklearn.decomposition import PCA\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "# Convert features to numpy for PCA\n",
+    "features_np = features.cpu().numpy().squeeze()\n",
+    "\n",
+    "# Apply PCA to reduce dimensionality for visualization\n",
+    "pca = PCA(n_components=3)\n",
+    "features_pca = pca.fit_transform(features_np)\n",
+    "\n",
+    "# Create a 3D visualization\n",
+    "fig = plt.figure(figsize=(10, 8))\n",
+    "ax = fig.add_subplot(111, projection='3d')\n",
+    "\n",
+    "# Plot the first 100 points (or fewer if there are fewer)\n",
+    "num_points = min(100, features_pca.shape[0])\n",
+    "scatter = ax.scatter(features_pca[:num_points, 0], \n",
+    "           features_pca[:num_points, 1], \n",
+    "           features_pca[:num_points, 2],\n",
+    "           c=range(num_points), \n",
+    "           cmap='viridis')\n",
+    "\n",
+    "ax.set_title('PCA of Feature Vectors')\n",
+    "ax.set_xlabel('PC1')\n",
+    "ax.set_ylabel('PC2')\n",
+    "ax.set_zlabel('PC3')\n",
+    "plt.colorbar(scatter, \n",
+    "             label='Feature Index')\n",
+    "plt.show()\n",
+    "\n",
+    "# Print variance explained by each component\n",
+    "print(\"Variance explained by principal components:\")\n",
+    "print(pca.explained_variance_ratio_)\n",
+    "print(f\"Total variance explained: {sum(pca.explained_variance_ratio_):.2f}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Try to use the features for inference (optional)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# If the model exposes a text_decoder or projection layer, we might try to use it\n",
+    "# This is a simplified example and might need adjustment based on the actual model structure\n",
+    "try:\n",
+    "    if hasattr(scripted_model, \"generate_text\") and callable(scripted_model.generate_text):\n",
+    "        # Some models might have a text generation function\n",
+    "        text = scripted_model.generate_text(features)\n",
+    "        print(f\"\\nGenerated text: {text}\")\n",
+    "        print(f\"Ground truth: {dataset[0]['text']}\")\n",
+    "    else:\n",
+    "        print(\"The model doesn't have a direct text generation method.\")\n",
+    "        print(\"The features might need to be passed to a separate text generation model.\")\n",
+    "except Exception as e:\n",
+    "    print(f\"Could not generate text: {e}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9. Alternative: Try direct image input if feature extraction doesn't work"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# If the above doesn't work, the model might expect direct image input for full processing\n",
+    "try:\n",
+    "    # Some TorchScript models might have different input expectations\n",
+    "    with torch.no_grad():\n",
+    "        alternative_output = scripted_model(processed_image)\n",
+    "    \n",
+    "    print(\"\\nAlternative direct input output:\")\n",
+    "    if isinstance(alternative_output, tuple):\n",
+    "        print(f\"Output is a tuple of length {len(alternative_output)}\")\n",
+    "        for i, item in enumerate(alternative_output):\n",
+    "            if torch.is_tensor(item):\n",
+    "                print(f\"Item {i} shape: {item.shape}\")\n",
+    "            else:\n",
+    "                print(f\"Item {i} type: {type(item)}\")\n",
+    "    elif torch.is_tensor(alternative_output):\n",
+    "        print(f\"Output shape: {alternative_output.shape}\")\n",
+    "    else:\n",
+    "        print(f\"Output type: {type(alternative_output)}\")\n",
+    "except Exception as e:\n",
+    "    print(f\"Alternative approach failed: {e}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 10. Summary\n",
+    "\n",
+    "We have:\n",
+    "1. Loaded the first image from the S3 dataset\n",
+    "2. Displayed the image with its ground truth caption\n",
+    "3. Loaded the converted model from MLflow\n",
+    "4. Performed manual preprocessing without using LAVIS\n",
+    "5. Run inference with the model\n",
+    "6. Visualized the extracted features\n",
+    "\n",
+    "The features extracted by the BLIP2 model can be used for tasks like image classification, captioning, or retrieval, but might require additional processing or models for generating the final text output."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.9"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
