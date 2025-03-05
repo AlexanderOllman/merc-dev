@@ -6,7 +6,7 @@
    "source": [
     "# Model Inference on First Image in Dataset\n",
     "\n",
-    "This notebook loads the converted BLIP2 model from MLflow and performs inference on the first image in the dataset."
+    "This file contains code to load the converted BLIP2 model from MLflow and perform inference on the first image in the dataset."
    ]
   },
   {
@@ -25,6 +25,7 @@
     "from PIL import Image\n",
     "from io import BytesIO\n",
     "import matplotlib.pyplot as plt\n",
+    "from torchvision import transforms\n",
     "\n",
     "# Set device\n",
     "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
@@ -167,7 +168,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 5. Preprocess the image"
+    "## 5. Preprocess the image manually (without LAVIS)"
    ]
   },
   {
@@ -176,14 +177,26 @@
    "metadata": {},
    "outputs": [],
    "source": [
-    "# Import LAVIS for preprocessing\n",
-    "from lavis.models import load_model_and_preprocess\n",
-    "\n",
-    "# Get the preprocessors only (we don't need the base model again)\n",
-    "_, vis_processors, _ = load_model_and_preprocess(\"blip2_feature_extractor\", model_type=\"pretrain\", is_eval=True)\n",
+    "# Define a custom preprocessing function based on standard BLIP2 preprocessing\n",
+    "def preprocess_image(image, size=224):\n",
+    "    # BLIP2 standard preprocessing\n",
+    "    transform = transforms.Compose([\n",
+    "        transforms.Resize((size, size)),\n",
+    "        transforms.ToTensor(),\n",
+    "        transforms.Normalize((0.48145466, 0.4578275, 0.40821073), \n",
+    "                             (0.26862954, 0.26130258, 0.27577711))\n",
+    "    ])\n",
+    "    \n",
+    "    # Convert to RGB if it's not already\n",
+    "    if image.mode != \"RGB\":\n",
+    "        image = image.convert(\"RGB\")\n",
+    "        \n",
+    "    # Apply transformations\n",
+    "    tensor = transform(image).unsqueeze(0)  # Add batch dimension\n",
+    "    return tensor\n",
     "\n",
     "# Preprocess the image\n",
-    "processed_image = vis_processors[\"eval\"](image).unsqueeze(0).to(device)\n",
+    "processed_image = preprocess_image(image).to(device)\n",
     "print(f\"Processed image shape: {processed_image.shape}\")"
    ]
   },
@@ -209,8 +222,6 @@
     "    \n",
     "print(f\"Output features shape: {features.shape}\")\n",
     "\n",
-    "# If the model is expected to output text directly, we might need to load a text processor\n",
-    "# But based on the notebook, this seems to be a feature extractor model\n",
     "# Displaying the first few features\n",
     "print(\"\\nFirst 10 feature values:\")\n",
     "print(features[0, :10].cpu().numpy())"
@@ -220,40 +231,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 7. Optional: Generate text from features\n",
-    "\n",
-    "If the model is a feature extractor, we might need to pass features to another model that generates text."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# If we have access to a text generator model that uses these features\n",
-    "try:\n",
-    "    # This is a conceptual example and may not work directly\n",
-    "    # We'd need the actual BLIP2 text generation part\n",
-    "    from lavis.models import load_model\n",
-    "    text_model = load_model(\"blip2_t5\", \"pretrain_flant5xl\").to(device)\n",
-    "    \n",
-    "    # Generate text from features\n",
-    "    with torch.no_grad():\n",
-    "        generated_text = text_model.generate({\"image_embeds\": features})\n",
-    "    \n",
-    "    print(f\"\\nGenerated text: {generated_text}\")\n",
-    "    print(f\"Ground truth: {dataset[0]['text']}\")\n",
-    "except Exception as e:\n",
-    "    print(f\"Could not generate text from features: {e}\")\n",
-    "    print(\"This may require additional models or processing steps.\")"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 8. Visualize Feature Map\n",
+    "## 7. Visualize Feature Map\n",
     "\n",
     "Let's visualize a projection of the feature vectors to better understand what the model has extracted."
    ]
@@ -280,7 +258,7 @@
     "\n",
     "# Plot the first 100 points (or fewer if there are fewer)\n",
     "num_points = min(100, features_pca.shape[0])\n",
-    "ax.scatter(features_pca[:num_points, 0], \n",
+    "scatter = ax.scatter(features_pca[:num_points, 0], \n",
     "           features_pca[:num_points, 1], \n",
     "           features_pca[:num_points, 2],\n",
     "           c=range(num_points), \n",
@@ -290,11 +268,7 @@
     "ax.set_xlabel('PC1')\n",
     "ax.set_ylabel('PC2')\n",
     "ax.set_zlabel('PC3')\n",
-    "plt.colorbar(ax.scatter(features_pca[:num_points, 0], \n",
-    "                        features_pca[:num_points, 1], \n",
-    "                        features_pca[:num_points, 2],\n",
-    "                        c=range(num_points), \n",
-    "                        cmap='viridis'), \n",
+    "plt.colorbar(scatter, \n",
     "             label='Feature Index')\n",
     "plt.show()\n",
     "\n",
@@ -308,16 +282,80 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 9. Summary\n",
+    "## 8. Try to use the features for inference (optional)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# If the model exposes a text_decoder or projection layer, we might try to use it\n",
+    "# This is a simplified example and might need adjustment based on the actual model structure\n",
+    "try:\n",
+    "    if hasattr(scripted_model, \"generate_text\") and callable(scripted_model.generate_text):\n",
+    "        # Some models might have a text generation function\n",
+    "        text = scripted_model.generate_text(features)\n",
+    "        print(f\"\\nGenerated text: {text}\")\n",
+    "        print(f\"Ground truth: {dataset[0]['text']}\")\n",
+    "    else:\n",
+    "        print(\"The model doesn't have a direct text generation method.\")\n",
+    "        print(\"The features might need to be passed to a separate text generation model.\")\n",
+    "except Exception as e:\n",
+    "    print(f\"Could not generate text: {e}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9. Alternative: Try direct image input if feature extraction doesn't work"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# If the above doesn't work, the model might expect direct image input for full processing\n",
+    "try:\n",
+    "    # Some TorchScript models might have different input expectations\n",
+    "    with torch.no_grad():\n",
+    "        alternative_output = scripted_model(processed_image)\n",
+    "    
+    "    print(\"\\nAlternative direct input output:\")\n",
+    "    if isinstance(alternative_output, tuple):\n",
+    "        print(f\"Output is a tuple of length {len(alternative_output)}\")\n",
+    "        for i, item in enumerate(alternative_output):\n",
+    "            if torch.is_tensor(item):\n",
+    "                print(f\"Item {i} shape: {item.shape}\")\n",
+    "            else:\n",
+    "                print(f\"Item {i} type: {type(item)}\")\n",
+    "    elif torch.is_tensor(alternative_output):\n",
+    "        print(f\"Output shape: {alternative_output.shape}\")\n",
+    "    else:\n",
+    "        print(f\"Output type: {type(alternative_output)}\")\n",
+    "except Exception as e:\n",
+    "    print(f\"Alternative approach failed: {e}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 10. Summary\n",
     "\n",
-    "We have successfully:\n",
+    "We have:\n",
     "1. Loaded the first image from the S3 dataset\n",
-    "2. Displayed the image\n",
+    "2. Displayed the image with its ground truth caption\n",
     "3. Loaded the converted model from MLflow\n",
-    "4. Performed inference on the image\n",
-    "5. Visualized the extracted features\n",
+    "4. Performed manual preprocessing without using LAVIS\n",
+    "5. Run inference with the model\n",
+    "6. Visualized the extracted features\n",
     "\n",
-    "The BLIP2 feature extractor model has processed the image and extracted meaningful features that could be used for various downstream tasks like image classification, captioning, or retrieval."
+    "The features extracted by the BLIP2 model can be used for tasks like image classification, captioning, or retrieval, but might require additional processing or models for generating the final text output."
    ]
   }
  ],
