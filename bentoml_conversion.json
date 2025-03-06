@@ -1,0 +1,560 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# MLflow to BentoML Model Conversion\n",
+    "\n",
+    "This notebook demonstrates how to:\n",
+    "1. Load a fine-tuned model from MLflow\n",
+    "2. Convert it to a BentoML model\n",
+    "3. Save it back to MLflow for deployment with a Bento server"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Install required packages\n",
+    "!pip install mlflow bentoml torch torchvision transformers pillow boto3 matplotlib"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Import required libraries"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import mlflow\n",
+    "import bentoml\n",
+    "from mlflow.tracking import MlflowClient\n",
+    "import torch\n",
+    "import boto3\n",
+    "import json\n",
+    "import numpy as np\n",
+    "from PIL import Image\n",
+    "from io import BytesIO\n",
+    "import matplotlib.pyplot as plt\n",
+    "from torchvision import transforms\n",
+    "import traceback\n",
+    "from typing import Dict, List, Any\n",
+    "\n",
+    "# Set device\n",
+    "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "model_dtype = torch.float16 if torch.cuda.is_available() else torch.float32\n",
+    "print(f\"Using device: {device} with dtype: {model_dtype}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Load the fine-tuned model from MLflow"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Refresh token if needed\n",
+    "%update_token\n",
+    "\n",
+    "# Get the latest version of the registered BLIP2 model\n",
+    "client = MlflowClient()\n",
+    "registered_model_name = \"blip_ft_production\"  # The name of your fine-tuned model in MLflow\n",
+    "\n",
+    "# Get the latest version\n",
+    "latest_versions = client.get_latest_versions(registered_model_name)\n",
+    "latest_version = None\n",
+    "\n",
+    "for version in latest_versions:\n",
+    "    if version.current_stage == \"Production\":\n",
+    "        latest_version = version\n",
+    "        break\n",
+    "    \n",
+    "if latest_version is None and len(latest_versions) > 0:\n",
+    "    latest_version = latest_versions[0]\n",
+    "\n",
+    "if latest_version is None:\n",
+    "    raise ValueError(f\"No versions found for model {registered_model_name}\")\n",
+    "\n",
+    "print(f\"Using model version: {latest_version.version}, stage: {latest_version.current_stage}\")\n",
+    "\n",
+    "# Get the model's artifact URI\n",
+    "model_uri = f\"models:/{registered_model_name}/{latest_version.version}\"\n",
+    "print(f\"Model URI: {model_uri}\")\n",
+    "\n",
+    "# Load the model from MLflow\n",
+    "feature_extractor = mlflow.pytorch.load_model(model_uri, map_location=device)\n",
+    "feature_extractor = feature_extractor.to(model_dtype)\n",
+    "feature_extractor.eval()\n",
+    "print(f\"Model loaded successfully with dtype: {next(feature_extractor.parameters()).dtype}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Define preprocessing and prediction functions"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Define a custom preprocessing function based on standard BLIP2 preprocessing\n",
+    "def preprocess_image(image, size=224):\n",
+    "    # BLIP2 standard preprocessing\n",
+    "    transform = transforms.Compose([\n",
+    "        transforms.Resize((size, size)),\n",
+    "        transforms.ToTensor(),\n",
+    "        transforms.Normalize((0.48145466, 0.4578275, 0.40821073), \n",
+    "                             (0.26862954, 0.26130258, 0.27577711))\n",
+    "    ])\n",
+    "    \n",
+    "    # Convert to RGB if it's not already\n",
+    "    if image.mode != \"RGB\":\n",
+    "        image = image.convert(\"RGB\")\n",
+    "        \n",
+    "    # Apply transformations\n",
+    "    tensor = transform(image).unsqueeze(0)  # Add batch dimension\n",
+    "    return tensor\n",
+    "\n",
+    "# Define a prediction function for BentoML\n",
+    "def predict(image):\n",
+    "    processed_image = preprocess_image(image).to(device).to(model_dtype)\n",
+    "    \n",
+    "    with torch.no_grad():\n",
+    "        features = feature_extractor(processed_image)\n",
+    "    \n",
+    "    return features.cpu().numpy()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Test the model with a sample image"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Configure S3 connection\n",
+    "object_storage_service_name = \"source-images-service\"\n",
+    "object_storage_namespace = \".ezdata-system\"\n",
+    "resource_type = \".svc\"\n",
+    "domain = \".cluster.local\"\n",
+    "object_storage_port = \"30000\"\n",
+    "\n",
+    "s3_endpoint_url = f\"http://{object_storage_service_name}{object_storage_namespace}{resource_type}{domain}:{object_storage_port}\"\n",
+    "print(f\"S3 endpoint URL: {s3_endpoint_url}\")\n",
+    "\n",
+    "# Create S3 clients\n",
+    "s3_client = boto3.client('s3', endpoint_url=s3_endpoint_url)\n",
+    "s3_resource = boto3.resource('s3', endpoint_url=s3_endpoint_url)\n",
+    "\n",
+    "# Set bucket name\n",
+    "bucket_name = \"poc-mercedes-gp\"\n",
+    "\n",
+    "# Load the dataset JSON file\n",
+    "file_key = \"training/training_dataset.json\"\n",
+    "response = s3_client.get_object(Bucket=bucket_name, Key=file_key)\n",
+    "content = response[\"Body\"].read().decode(\"utf-8\")\n",
+    "dataset = json.loads(content)\n",
+    "\n",
+    "# Get the first image\n",
+    "first_image_key = dataset[0]['s3_key']\n",
+    "print(f\"First image S3 key: {first_image_key}\")\n",
+    "\n",
+    "# Download the image\n",
+    "response = s3_client.get_object(Bucket=bucket_name, Key=first_image_key)\n",
+    "image_data = response['Body'].read()\n",
+    "\n",
+    "# Convert to PIL Image\n",
+    "image = Image.open(BytesIO(image_data))\n",
+    "\n",
+    "# Display the image\n",
+    "plt.figure(figsize=(10, 10))\n",
+    "plt.imshow(image)\n",
+    "plt.axis('off')\n",
+    "plt.title(f\"Image: {first_image_key.split('/')[-1]}\\nGround Truth: {dataset[0]['text']}\")\n",
+    "plt.show()\n",
+    "\n",
+    "# Test the model\n",
+    "features = predict(image)\n",
+    "print(f\"Feature shape: {features.shape}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Create a BentoML model wrapper class"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class BlipFeatureExtractor(torch.nn.Module):\n",
+    "    def __init__(self, model):\n",
+    "        super().__init__()\n",
+    "        self.model = model\n",
+    "        self.transform = transforms.Compose([\n",
+    "            transforms.Resize((224, 224)),\n",
+    "            transforms.ToTensor(),\n",
+    "            transforms.Normalize((0.48145466, 0.4578275, 0.40821073), \n",
+    "                                 (0.26862954, 0.26130258, 0.27577711))\n",
+    "        ])\n",
+    "    \n",
+    "    def forward(self, image):\n",
+    "        if isinstance(image, np.ndarray):\n",
+    "            image = Image.fromarray(image.astype('uint8'))\n",
+    "        \n",
+    "        if isinstance(image, Image.Image):\n",
+    "            # Convert to RGB if it's not already\n",
+    "            if image.mode != \"RGB\":\n",
+    "                image = image.convert(\"RGB\")\n",
+    "            \n",
+    "            # Apply transformations\n",
+    "            image = self.transform(image).unsqueeze(0)  # Add batch dimension\n",
+    "        \n",
+    "        if isinstance(image, torch.Tensor):\n",
+    "            # Ensure the image is on the right device and dtype\n",
+    "            device = next(self.model.parameters()).device\n",
+    "            dtype = next(self.model.parameters()).dtype\n",
+    "            image = image.to(device).to(dtype)\n",
+    "        \n",
+    "        with torch.no_grad():\n",
+    "            features = self.model(image)\n",
+    "        \n",
+    "        return features\n",
+    "\n",
+    "# Create the BentoML model wrapper\n",
+    "blip_wrapper = BlipFeatureExtractor(feature_extractor)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Save the model to BentoML"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Save the model to BentoML\n",
+    "bentoml_model_name = \"blip_feature_extractor\"\n",
+    "bentoml_model_version = \"v1\"\n",
+    "\n",
+    "# Get model metadata from MLflow\n",
+    "run = mlflow.tracking.MlflowClient().get_run(latest_version.run_id)\n",
+    "mlflow_metadata = run.data.params if run.data.params else {}\n",
+    "\n",
+    "# Add additional metadata\n",
+    "metadata = {\n",
+    "    \"framework\": \"pytorch\",\n",
+    "    \"model_type\": \"BLIP2\",\n",
+    "    \"mlflow_model_name\": registered_model_name,\n",
+    "    \"mlflow_model_version\": latest_version.version,\n",
+    "    **mlflow_metadata\n",
+    "}\n",
+    "\n",
+    "# Save the model to BentoML\n",
+    "bentoml_model = bentoml.pytorch.save_model(\n",
+    "    name=bentoml_model_name,\n",
+    "    model=blip_wrapper,\n",
+    "    signatures={\n",
+    "        \"__call__\": {\n",
+    "            \"batchable\": True,\n",
+    "        },\n",
+    "    },\n",
+    "    labels={\n",
+    "        \"framework\": \"pytorch\",\n",
+    "        \"model_type\": \"BLIP2\",\n",
+    "    },\n",
+    "    metadata=metadata,\n",
+    "    external_modules=[],\n",
+    ")\n",
+    "\n",
+    "print(f\"Model saved to BentoML: {bentoml_model.tag}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Test the BentoML model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Load the model from BentoML\n",
+    "loaded_model = bentoml.pytorch.load_model(bentoml_model.tag)\n",
+    "\n",
+    "# Test the loaded model\n",
+    "processed_image = preprocess_image(image).to(device).to(model_dtype)\n",
+    "with torch.no_grad():\n",
+    "    bentoml_features = loaded_model(processed_image)\n",
+    "\n",
+    "print(f\"BentoML model features shape: {bentoml_features.shape}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Create a BentoML service"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "%%writefile service.py\n",
+    "\n",
+    "import bentoml\n",
+    "import torch\n",
+    "import numpy as np\n",
+    "from PIL import Image\n",
+    "from io import BytesIO\n",
+    "\n",
+    "# Define the service\n",
+    "runner = bentoml.pytorch.get(\"blip_feature_extractor:latest\").to_runner()\n",
+    "\n",
+    "svc = bentoml.Service(\"blip_feature_extractor\", runners=[runner])\n",
+    "\n",
+    "@svc.api(input=bentoml.io.Image(), output=bentoml.io.NumpyNdarray())\n",
+    "def extract_features(img):\n",
+    "    # The preprocessing is now handled in the model wrapper\n",
+    "    features = runner.run(img)\n",
+    "    return features.cpu().numpy()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9. Export the BentoML model to MLflow"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Start a new MLflow run\n",
+    "mlflow.set_experiment(\"BentoML-BLIP2\")\n",
+    "\n",
+    "with mlflow.start_run(run_name=\"bentoml_conversion\") as run:\n",
+    "    # Log parameters\n",
+    "    mlflow.log_param(\"bentoml_model_tag\", bentoml_model.tag)\n",
+    "    mlflow.log_param(\"original_mlflow_model\", f\"{registered_model_name}/{latest_version.version}\")\n",
+    "    \n",
+    "    # Create a directory for the BentoML model export\n",
+    "    export_dir = \"bentoml_export\"\n",
+    "    os.makedirs(export_dir, exist_ok=True)\n",
+    "    \n",
+    "    # Export BentoML model metadata to a file\n",
+    "    with open(f\"{export_dir}/bentoml_metadata.json\", \"w\") as f:\n",
+    "        json.dump({\n",
+    "            \"tag\": bentoml_model.tag,\n",
+    "            \"creation_time\": bentoml_model.creation_time.isoformat(),\n",
+    "            \"labels\": bentoml_model.labels,\n",
+    "            \"metadata\": bentoml_model.metadata,\n",
+    "        }, f, indent=2)\n",
+    "    \n",
+    "    # Log metadata file as an artifact\n",
+    "    mlflow.log_artifact(f\"{export_dir}/bentoml_metadata.json\")\n",
+    "    \n",
+    "    # Export the service.py file\n",
+    "    mlflow.log_artifact(\"service.py\")\n",
+    "    \n",
+    "    # Create and log bentofile.yaml\n",
+    "    bentofile_content = f\"\"\"\n",
+    "service: \"service:svc\"\n",
+    "description: \"BLIP2 Feature Extractor Service\"\n",
+    "labels:\n",
+    "  model: \"blip2\"\n",
+    "  framework: \"pytorch\"\n",
+    "include:\n",
+    "- \"service.py\"\n",
+    "python:\n",
+    "  packages:\n",
+    "  - torch\n",
+    "  - pillow\n",
+    "  - numpy\n",
+    "    \"\"\"\n",
+    "    \n",
+    "    with open(f\"{export_dir}/bentofile.yaml\", \"w\") as f:\n",
+    "        f.write(bentofile_content)\n",
+    "    \n",
+    "    mlflow.log_artifact(f\"{export_dir}/bentofile.yaml\")\n",
+    "    \n",
+    "    # Save the PyTorch model directly to MLflow\n",
+    "    mlflow.pytorch.log_model(\n",
+    "        loaded_model,\n",
+    "        \"bentoml_blip_model\",\n",
+    "        registered_model_name=\"blip_bentoml_production\",\n",
+    "    )\n",
+    "    \n",
+    "    # Get the run ID\n",
+    "    run_id = run.info.run_id\n",
+    "    \n",
+    "    print(f\"MLflow run ID: {run_id}\")\n",
+    "    print(f\"MLflow experiment URL: {mlflow.get_artifact_uri()}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 10. Create a Bento from the BentoML model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Build a bento\n",
+    "!bentoml build\n",
+    "\n",
+    "# List available bentos\n",
+    "!bentoml list"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 11. Test invoking the Bento service"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Serve the model in the background\n",
+    "!bentoml serve service:svc &\n",
+    "\n",
+    "# Allow some time for the service to start\n",
+    "import time\n",
+    "time.sleep(5)\n",
+    "\n",
+    "# Test the API with a sample image\n",
+    "import requests\n",
+    "\n",
+    "# Save the sample image to a file\n",
+    "image_path = \"sample_image.jpg\"\n",
+    "image.save(image_path)\n",
+    "\n",
+    "# Send the image to the API\n",
+    "with open(image_path, \"rb\") as f:\n",
+    "    response = requests.post(\n",
+    "        \"http://localhost:3000/extract_features\",\n",
+    "        files={\"img\": (\"image.jpg\", f, \"image/jpeg\")}\n",
+    "    )\n",
+    "\n",
+    "if response.status_code == 200:\n",
+    "    features = np.array(response.json())\n",
+    "    print(f\"API response features shape: {features.shape}\")\n",
+    "else:\n",
+    "    print(f\"Error: {response.status_code}\")\n",
+    "    print(response.text)\n",
+    "\n",
+    "# Stop the service\n",
+    "!pkill -f \"bentoml serve\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 12. Summary"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We have successfully:\n",
+    "1. Loaded the fine-tuned BLIP2 model from MLflow\n",
+    "2. Converted it to a BentoML model\n",
+    "3. Created a BentoML service to serve the model\n",
+    "4. Saved the BentoML model and service definition back to MLflow\n",
+    "5. Built and tested a Bento service\n",
+    "\n",
+    "The model is now ready for deployment with BentoML, which provides additional capabilities like:\n",
+    "- Adaptive batching\n",
+    "- Request queueing\n",
+    "- Monitoring and metrics\n",
+    "- Containerization and Kubernetes deployment\n",
+    "- API management features\n",
+    "\n",
+    "To deploy the Bento service to production, you can use BentoML's deployment options, such as:\n",
+    "```bash\n",
+    "bentoml containerize blip_feature_extractor:latest\n",
+    "```\n",
+    "\n",
+    "Or use BentoML's Kubernetes operator, Yatai, for orchestrated deployments."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+} 

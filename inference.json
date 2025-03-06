@@ -125,7 +125,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 4. Load both the BLIP2 feature extractor and language model"
+    "## 4. Load the fine-tuned BLIP model"
    ]
   },
   {
@@ -162,44 +162,23 @@
     "model_uri = f\"models:/{registered_model_name}/{latest_version.version}\"\n",
     "print(f\"BLIP2 model URI: {model_uri}\")\n",
     "\n",
-    "# Load the feature extractor model from MLflow\n",
-    "feature_extractor = mlflow.pytorch.load_model(model_uri, map_location=device)\n",
-    "feature_extractor = feature_extractor.to(model_dtype)\n",
-    "feature_extractor.eval()\n",
-    "print(f\"BLIP2 feature extractor loaded successfully with dtype: {next(feature_extractor.parameters()).dtype}\")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Load the OPT language model\n",
-    "from transformers import AutoTokenizer, OPTForCausalLM\n",
-    "import torch.nn as nn\n",
+    "# Load the fine-tuned model from MLflow\n",
+    "ft_model = mlflow.pytorch.load_model(model_uri, map_location=device)\n",
+    "ft_model = ft_model.to(model_dtype)\n",
+    "ft_model.eval()\n",
+    "print(f\"BLIP2 model loaded successfully with dtype: {next(ft_model.parameters()).dtype}\")\n",
     "\n",
-    "# We'll use a smaller OPT model to keep memory usage reasonable\n",
-    "model_id = \"facebook/opt-1.3b\"\n",
-    "print(f\"Loading language model: {model_id}\")\n",
-    "\n",
-    "tokenizer = AutoTokenizer.from_pretrained(model_id)\n",
-    "language_model = OPTForCausalLM.from_pretrained(\n",
-    "    model_id, \n",
-    "    torch_dtype=model_dtype,\n",
-    "    device_map=\"auto\"\n",
-    ")\n",
-    "language_model.eval()\n",
-    "\n",
-    "print(f\"Language model loaded with {sum(p.numel() for p in language_model.parameters())/1e6:.1f}M parameters\")\n",
-    "print(f\"Language model dtype: {next(language_model.parameters()).dtype}\")"
+    "# Create a processor for the model\n",
+    "from transformers import BlipProcessor\n",
+    "processor = BlipProcessor.from_pretrained(\"Salesforce/blip-image-captioning-base\")\n",
+    "print(\"BLIP Processor loaded successfully\")"
    ]
   },
   {
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 5. Preprocess the image and extract features"
+    "## 5. Define image preprocessing and caption generation functions"
    ]
   },
   {
@@ -208,190 +187,33 @@
    "metadata": {},
    "outputs": [],
    "source": [
-    "# Define a custom preprocessing function based on standard BLIP2 preprocessing\n",
-    "def preprocess_image(image, size=224):\n",
-    "    # BLIP2 standard preprocessing\n",
-    "    transform = transforms.Compose([\n",
-    "        transforms.Resize((size, size)),\n",
-    "        transforms.ToTensor(),\n",
-    "        transforms.Normalize((0.48145466, 0.4578275, 0.40821073), \n",
-    "                             (0.26862954, 0.26130258, 0.27577711))\n",
-    "    ])\n",
+    "# Define a function to generate captions using the fine-tuned model directly\n",
+    "def generate_caption(image, prompt=\"This image shows\", temperature=0.5):\n",
+    "    # Process the image using the BLIP processor\n",
+    "    inputs = processor(image, prompt, return_tensors=\"pt\").to(device, model_dtype)\n",
     "    \n",
-    "    # Convert to RGB if it's not already\n",
-    "    if image.mode != \"RGB\":\n",
-    "        image = image.convert(\"RGB\")\n",
-    "        \n",
-    "    # Apply transformations\n",
-    "    tensor = transform(image).unsqueeze(0)  # Add batch dimension\n",
-    "    return tensor\n",
-    "\n",
-    "# Preprocess the image\n",
-    "processed_image = preprocess_image(image).to(device)\n",
-    "print(f\"Processed image shape: {processed_image.shape}\")\n",
-    "print(f\"Processed image dtype: {processed_image.dtype}\")\n",
-    "\n",
-    "# Extract features with BLIP2\n",
-    "with torch.no_grad():\n",
-    "    # Convert image to match model dtype at the last moment\n",
-    "    processed_image = processed_image.to(model_dtype)\n",
-    "    # Verify the dtypes match\n",
-    "    model_dtype_actual = next(feature_extractor.parameters()).dtype\n",
-    "    print(f\"Model dtype: {model_dtype_actual}, Input dtype: {processed_image.dtype}\")\n",
-    "    \n",
-    "    if processed_image.dtype != model_dtype_actual:\n",
-    "        print(f\"WARNING: Converting input from {processed_image.dtype} to {model_dtype_actual}\")\n",
-    "        processed_image = processed_image.to(model_dtype_actual)\n",
-    "    \n",
-    "    # Now extract features\n",
-    "    image_features = feature_extractor(processed_image)\n",
-    "    \n",
-    "print(f\"Extracted features shape: {image_features.shape}\")\n",
-    "print(f\"Extracted features dtype: {image_features.dtype}\")\n",
-    "\n",
-    "# We'll use the class token (first token) for generation\n",
-    "class_token = image_features[:, 0, :].to(device)\n",
-    "print(f\"Class token shape: {class_token.shape}\")\n",
-    "print(f\"Class token dtype: {class_token.dtype}\")"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 6. Define the cross-attention generation function"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Helper function for sampling\n",
-    "def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):\n",
-    "    \"\"\" Filter a distribution of logits using top-k and/or nucleus (top-p) filtering \"\"\"\n",
-    "    # Handle both single and batch dimensions\n",
-    "    if logits.dim() > 1:\n",
-    "        # Apply filtering to each item in the batch\n",
-    "        filtered_logits = logits.clone()\n",
-    "        for batch_idx in range(logits.size(0)):\n",
-    "            filtered_logits[batch_idx] = top_k_top_p_filtering(\n",
-    "                logits[batch_idx], top_k=top_k, top_p=top_p, filter_value=filter_value\n",
+    "    # Generate caption using the fine-tuned model directly\n",
+    "    try:\n",
+    "        with torch.no_grad():\n",
+    "            generated_ids = ft_model.generate(\n",
+    "                **inputs,\n",
+    "                max_length=50,\n",
+    "                num_beams=5,\n",
+    "                temperature=temperature\n",
     "            )\n",
-    "        return filtered_logits\n",
-    "    \n",
-    "    assert logits.dim() == 1  # Handle scalar inputs\n",
-    "    top_k = min(top_k, logits.size(-1))  # Safety check\n",
-    "    \n",
-    "    if top_k > 0:\n",
-    "        # Remove all tokens with a probability less than the last token of the top-k\n",
-    "        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]\n",
-    "        logits[indices_to_remove] = filter_value\n",
-    "    \n",
-    "    if top_p > 0.0:\n",
-    "        sorted_logits, sorted_indices = torch.sort(logits, descending=True)\n",
-    "        cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)\n",
-    "        \n",
-    "        # Remove tokens with cumulative probability above the threshold\n",
-    "        sorted_indices_to_remove = cumulative_probs > top_p\n",
-    "        # Shift the indices to the right to keep also the first token above the threshold\n",
-    "        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()\n",
-    "        sorted_indices_to_remove[..., 0] = 0\n",
-    "        \n",
-    "        indices_to_remove = sorted_indices[sorted_indices_to_remove]\n",
-    "        logits[indices_to_remove] = filter_value\n",
-    "    \n",
-    "    return logits\n",
-    "\n",
-    "def generate_with_cross_attention(image_features, prompt, max_length=30, existing_projection_layer=None, temperature=0.7):
-        # Tokenize prompt
-        encoded_prompt = tokenizer(prompt, return_tensors=\"pt\").to(device)
-        input_ids = encoded_prompt.input_ids
-        
-        # Get model's hidden dimension
-        hidden_size = language_model.config.hidden_size
-        print(f\"Language model hidden size: {hidden_size}\")
-        print(f\"Image features shape: {image_features.shape}\")
-        
-        # Use the provided projection layer or create a new one
-        if existing_projection_layer is not None and isinstance(existing_projection_layer, torch.nn.Module):
-            if existing_projection_layer.in_features == image_features.shape[-1] and existing_projection_layer.out_features == hidden_size:
-                projection_layer = existing_projection_layer
-                print(\"Using existing projection layer\")
-            else:
-                print(f\"Existing projection layer dimensions don't match: {existing_projection_layer.in_features} -> {existing_projection_layer.out_features}\")
-                print(\"Creating new projection layer\")
-                projection_layer = torch.nn.Linear(image_features.shape[-1], hidden_size).to(device).to(model_dtype)
-                torch.nn.init.normal_(projection_layer.weight, std=0.01)
-                torch.nn.init.zeros_(projection_layer.bias)
-        else:
-            print(\"Creating new projection layer\")
-            projection_layer = torch.nn.Linear(image_features.shape[-1], hidden_size).to(device).to(model_dtype)
-            torch.nn.init.normal_(projection_layer.weight, std=0.01)
-            torch.nn.init.zeros_(projection_layer.bias)
-        
-        # Project image features to match the model's hidden dimension
-        print(f\"Image features dtype before projection: {image_features.dtype}\")
-        print(f\"Projection layer weight dtype: {projection_layer.weight.dtype}\")
-        
-        # Ensure image features have the correct dtype
-        if image_features.dtype != projection_layer.weight.dtype:
-            image_features = image_features.to(projection_layer.weight.dtype)
-            print(f\"Converted image features to {image_features.dtype}\")
-            
-        projected_img_features = projection_layer(image_features)
-        print(f\"Projected features shape: {projected_img_features.shape}\")
-        
-        # Initialize generation
-        cur_len = input_ids.shape[1]
-        context = input_ids.clone()
-        
-        # Generate one token at a time using a simplified approach
-        while cur_len < max_length:
-            with torch.no_grad():
-                # Use a simpler approach - get the embeddings directly
-                outputs = language_model(
-                    input_ids=context
-                )
-                
-                # Get logits from the output
-                next_token_logits = outputs.logits[:, -1, :]
-                
-                # Modify logits based on image features
-                # Convert to same dtype if needed
-                if projected_img_features.dtype != next_token_logits.dtype:
-                    projected_img_features = projected_img_features.to(next_token_logits.dtype)
-                
-                # Scale and add the image features influence through a simple linear projection to the logits space
-                image_logits = torch.matmul(projected_img_features, language_model.lm_head.weight.t())
-                
-                # Combine model logits with image influence
-                combined_logits = next_token_logits + 0.1 * image_logits
-                
-                # Sample next token (with temperature)
-                combined_logits = combined_logits / temperature
-                filtered_logits = top_k_top_p_filtering(combined_logits, top_k=50, top_p=0.9)
-                probs = torch.nn.functional.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                
-                context = torch.cat([context, next_token], dim=1)
-                cur_len += 1
-                
-                # Stop if we generate an EOS token
-                if next_token.item() == tokenizer.eos_token_id:
-                    break
-        
-        # Decode the generated text
-        generated_text = tokenizer.decode(context[0], skip_special_tokens=True)
-        return generated_text, projection_layer"
+    "            caption = processor.decode(generated_ids[0], skip_special_tokens=True)\n",
+    "        return caption\n",
+    "    except Exception as e:\n",
+    "        print(f\"Error generating caption: {e}\")\n",
+    "        traceback.print_exc()\n",
+    "        return \"Error generating caption\"\n"
    ]
   },
   {
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 7. Generate captions using cross-attention"
+    "## 6. Generate caption for the first image"
    ]
   },
   {
@@ -400,45 +222,17 @@
    "metadata": {},
    "outputs": [],
    "source": [
-    "# Debug shapes and dtypes\n",
-    "print(f\"Class token shape: {class_token.shape}\")\n",
-    "print(f\"Language model hidden size: {language_model.config.hidden_size}\")\n",
-    "print(f\"Model dtype: {next(language_model.parameters()).dtype}\")\n",
-    "\n",
-    "# Check if we already have a projection layer\n",
-    "try:\n",
-    "    # First check if the variable exists and is not None\n",
-    "    if 'projection_layer' in locals() and projection_layer is not None:\n",
-    "        print(f\"Projection layer exists: in_features={projection_layer.in_features}, out_features={projection_layer.out_features}\")\n",
-    "    else:\n",
-    "        print(\"No projection layer exists yet, one will be created\")\n",
-    "        projection_layer = None\n",
-    "except Exception as e:\n",
-    "    print(f\"Error checking projection layer: {e}\")\n",
-    "    print(\"Creating a new projection layer\")\n",
-    "    projection_layer = None\n",
-    "\n",
-    "# Execute the cross-attention generation\n",
-    "try:\n",
-    "    print(\"Using cross-attention approach:\")\n",
-    "    result, projection_layer = generate_with_cross_attention(\n",
-    "        class_token, \n",
-    "        \"This image shows\", \n",
-    "        existing_projection_layer=projection_layer,\n",
-    "        temperature=0.7\n",
-    "    )\n",
-    "    print(f\"\\nGenerated caption: {result}\")\n",
-    "except Exception as e:\n",
-    "    print(f\"Error with cross-attention approach: {e}\")\n",
-    "    traceback.print_exc()\n",
-    "    print(\"This approach requires a more detailed implementation with the specific model architecture.\")"
+    "# Generate caption for the first image\n",
+    "result = generate_caption(image, prompt=\"This image shows\")\n",
+    "print(f\"\\nGround Truth: {dataset[0]['text']}\")\n",
+    "print(f\"Generated caption: {result}\")"
    ]
   },
   {
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 8. Try multiple prompts for diverse captions"
+    "## 7. Try multiple prompts for diverse captions"
    ]
   },
   {
@@ -447,12 +241,10 @@
    "metadata": {},
    "outputs": [],
    "source": [
-    "# Ground truth caption\n",
-    "print(f\"Ground Truth: {dataset[0]['text']}\")\n",
+    "# Try different prompts\n",
     "print(\"\\nGenerated Captions with Different Prompts:\")\n",
     "print(\"-\" * 60)\n",
     "\n",
-    "# Try different prompts\n",
     "prompts = [\n",
     "    \"This image shows\",\n",
     "    \"I can see\",\n",
@@ -462,12 +254,7 @@
     "\n",
     "for prompt in prompts:\n",
     "    try:\n",
-    "        result, projection_layer = generate_with_cross_attention(\n",
-    "            class_token, \n",
-    "            prompt,\n",
-    "            existing_projection_layer=projection_layer,\n",
-    "            temperature=0.8  # Slightly higher temperature for diversity\n",
-    "        )\n",
+    "        result = generate_caption(image, prompt=prompt, temperature=0.7)\n",
     "        print(f\"Prompt: '{prompt}'\")\n",
     "        print(f\"Generated: '{result}'\")\n",
     "        print(\"-\" * 60)\n",
@@ -479,7 +266,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 9. Process additional test images"
+    "## 8. Process additional test images"
    ]
   },
   {
@@ -513,21 +300,8 @@
     "            plt.title(f\"Ground Truth: {dataset[idx]['text']}\")\n",
     "            plt.show()\n",
     "            \n",
-    "            # Preprocess and extract features
-            processed_test_image = preprocess_image(test_image).to(device)
-            
-            with torch.no_grad():
-                # Convert test image to match model dtype
-                processed_test_image = processed_test_image.to(model_dtype)
-                test_features = feature_extractor(processed_test_image)
-                test_class_token = test_features[:, 0, :].to(device)
-            
-            # Generate caption with the best prompt
-            result, projection_layer = generate_with_cross_attention(\n",
-    "                test_class_token,\n",
-    "                \"This image shows\",\n",
-    "                existing_projection_layer=projection_layer\n",
-    "            )\n",
+    "            # Generate caption\n",
+    "            result = generate_caption(test_image, prompt=\"This image shows\")\n",
     "            \n",
     "            print(f\"Ground Truth: {dataset[idx]['text']}\")\n",
     "            print(f\"Generated Caption: {result}\")\n",
@@ -541,7 +315,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 10. Evaluate caption quality"
+    "## 9. Evaluate caption quality"
    ]
   },
   {
@@ -550,24 +324,20 @@
    "metadata": {},
    "outputs": [],
    "source": [
-    "# You can implement evaluation metrics for captions if needed\n",
-    "# Examples: BLEU, ROUGE, etc.\n",
-    "# For simplicity, we'll just compare with ground truth manually\n",
-    "\n",
+    "# Caption evaluation section\n",
     "print(\"Caption Evaluation:\")\n",
     "print(\"-\" * 60)\n",
-    "print(\"This implementation uses a cross-attention mechanism to combine image features\")\n",
-    "print(\"extracted by the fine-tuned BLIP2 model with a language model for caption generation.\")\n",
+    "print(\"This implementation uses the fine-tuned BLIP model directly for caption generation,\")\n",
+    "print(\"rather than using it as a feature extractor with a separate language model.\")\n",
     "print(\"\\nThe quality of the generated captions depends on several factors:\")\n",
-    "print(\"1. The quality of the BLIP2 fine-tuning on the domain-specific dataset\")\n",
-    "print(\"2. The effectiveness of the projection layer in mapping between feature spaces\")\n",
-    "print(\"3. The ability of the OPT language model to generate coherent text\")\n",
-    "print(\"4. The cross-attention implementation's ability to condition on image features\")\n",
+    "print(\"1. The quality of the BLIP fine-tuning on the domain-specific dataset\")\n",
+    "print(\"2. The appropriateness of the prompts used to condition generation\")\n",
+    "print(\"3. The generation parameters (temperature, number of beams, etc.)\")\n",
     "print(\"\\nFuture improvements could include:\")\n",
-    "print(\"- Fine-tuning the projection layer on image-text pairs\")\n",
-    "print(\"- Using a larger language model for better text generation\")\n",
-    "print(\"- Implementing true cross-attention rather than feature injection\")\n",
-    "print(\"- Adding beam search or other advanced decoding strategies\")"
+    "print(\"- Using more domain-specific prompts\")\n",
+    "print(\"- Experimenting with different generation parameters\")\n",
+    "print(\"- Implementing quantitative evaluation metrics (BLEU, ROUGE, etc.)\")\n",
+    "print(\"- Gathering human feedback on caption quality\")"
    ]
   }
  ],
