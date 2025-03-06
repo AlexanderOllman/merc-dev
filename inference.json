@@ -164,8 +164,9 @@
     "\n",
     "# Load the feature extractor model from MLflow\n",
     "feature_extractor = mlflow.pytorch.load_model(model_uri, map_location=device)\n",
+    "feature_extractor = feature_extractor.to(model_dtype)\n",
     "feature_extractor.eval()\n",
-    "print(\"BLIP2 feature extractor loaded successfully\")"
+    "print(f\"BLIP2 feature extractor loaded successfully with dtype: {next(feature_extractor.parameters()).dtype}\")"
    ]
   },
   {
@@ -226,18 +227,32 @@
     "    return tensor\n",
     "\n",
     "# Preprocess the image\n",
-    "processed_image = preprocess_image(image).to(device).to(model_dtype)\n",
+    "processed_image = preprocess_image(image).to(device)\n",
     "print(f\"Processed image shape: {processed_image.shape}\")\n",
+    "print(f\"Processed image dtype: {processed_image.dtype}\")\n",
     "\n",
     "# Extract features with BLIP2\n",
     "with torch.no_grad():\n",
+    "    # Convert image to match model dtype at the last moment\n",
+    "    processed_image = processed_image.to(model_dtype)\n",
+    "    # Verify the dtypes match\n",
+    "    model_dtype_actual = next(feature_extractor.parameters()).dtype\n",
+    "    print(f\"Model dtype: {model_dtype_actual}, Input dtype: {processed_image.dtype}\")\n",
+    "    \n",
+    "    if processed_image.dtype != model_dtype_actual:\n",
+    "        print(f\"WARNING: Converting input from {processed_image.dtype} to {model_dtype_actual}\")\n",
+    "        processed_image = processed_image.to(model_dtype_actual)\n",
+    "    \n",
+    "    # Now extract features\n",
     "    image_features = feature_extractor(processed_image)\n",
     "    \n",
     "print(f\"Extracted features shape: {image_features.shape}\")\n",
+    "print(f\"Extracted features dtype: {image_features.dtype}\")\n",
     "\n",
     "# We'll use the class token (first token) for generation\n",
-    "class_token = image_features[:, 0, :].to(device).to(model_dtype)\n",
-    "print(f\"Class token shape: {class_token.shape}\")"
+    "class_token = image_features[:, 0, :].to(device)\n",
+    "print(f\"Class token shape: {class_token.shape}\")\n",
+    "print(f\"Class token dtype: {class_token.dtype}\")"
    ]
   },
   {
@@ -289,107 +304,87 @@
     "    \n",
     "    return logits\n",
     "\n",
-    "def generate_with_cross_attention(image_features, prompt, max_length=30, existing_projection_layer=None, temperature=0.7):\n",
-    "    # Tokenize prompt\n",
-    "    encoded_prompt = tokenizer(prompt, return_tensors=\"pt\").to(device)\n",
-    "    input_ids = encoded_prompt.input_ids\n",
-    "    \n",
-    "    # Get model's hidden dimension\n",
-    "    hidden_size = language_model.config.hidden_size\n",
-    "    print(f\"Language model hidden size: {hidden_size}\")\n",
-    "    print(f\"Image features shape: {image_features.shape}\")\n",
-    "    \n",
-    "    # Use the provided projection layer or create a new one\n",
-    "    if existing_projection_layer is not None and isinstance(existing_projection_layer, torch.nn.Module):\n",
-    "        if existing_projection_layer.in_features == image_features.shape[-1] and existing_projection_layer.out_features == hidden_size:\n",
-    "            projection_layer = existing_projection_layer\n",
-    "            print(\"Using existing projection layer\")\n",
-    "        else:\n",
-    "            print(f\"Existing projection layer dimensions don't match: {existing_projection_layer.in_features} -> {existing_projection_layer.out_features}\")\n",
-    "            print(\"Creating new projection layer\")\n",
-    "            projection_layer = torch.nn.Linear(image_features.shape[-1], hidden_size).to(device).to(model_dtype)\n",
-    "            torch.nn.init.normal_(projection_layer.weight, std=0.01)\n",
-    "            torch.nn.init.zeros_(projection_layer.bias)\n",
-    "    else:\n",
-    "        print(\"Creating new projection layer\")\n",
-    "        projection_layer = torch.nn.Linear(image_features.shape[-1], hidden_size).to(device).to(model_dtype)\n",
-    "        torch.nn.init.normal_(projection_layer.weight, std=0.01)\n",
-    "        torch.nn.init.zeros_(projection_layer.bias)\n",
-    "    \n",
-    "    # Project image features to match the model's hidden dimension\n",
-    "    print(f\"Image features dtype before projection: {image_features.dtype}\")\n",
-    "    print(f\"Projection layer weight dtype: {projection_layer.weight.dtype}\")\n",
-    "    \n",
-    "    projected_img_features = projection_layer(image_features)\n",
-    "    print(f\"Projected features shape: {projected_img_features.shape}\")\n",
-    "    \n",
-    "    # Initialize generation\n",
-    "    cur_len = input_ids.shape[1]\n",
-    "    context = input_ids.clone()\n",
-    "    \n",
-    "    # Generate one token at a time\n",
-    "    while cur_len < max_length:\n",
-    "        with torch.no_grad():\n",
-    "            # Get model embeddings\n",
-    "            inputs_embeds = language_model.model.decoder.embed_tokens(context)\n",
-    "            \n",
-    "            # Forward pass through model layers\n",
-    "            hidden_states = inputs_embeds\n",
-    "            \n",
-    "            # Create attention mask and causal mask\n",
-    "            attention_mask = torch.ones(context.shape, device=context.device, dtype=torch.long)\n",
-    "            seq_length = context.shape[1]\n",
-    "            \n",
-    "            # Create causal mask - shape must be [batch_size, 1, seq_length, seq_length]\n",
-    "            causal_mask = torch.tril(torch.ones((seq_length, seq_length), device=context.device))\n",
-    "            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]\n",
-    "            \n",
-    "            # Manually apply each transformer layer with our image features\n",
-    "            for i, layer in enumerate(language_model.model.decoder.layers):\n",
-    "                # Apply self-attention with causal mask - without use_cache parameter\n",
-    "                layer_outputs = layer.self_attn(\n",
-    "                    hidden_states=hidden_states,\n",
-    "                    attention_mask=causal_mask,\n",
-    "                    past_key_value=None\n",
-    "                )\n",
-    "                hidden_states = layer.self_attn_layer_norm(hidden_states + layer_outputs[0])\n",
-    "                \n",
-    "                # Simulate cross-attention by adding image features\n",
-    "                # Expand image features to match the sequence length\n",
-    "                image_features_expanded = projected_img_features.expand(-1, hidden_states.shape[1], -1)\n",
-    "                \n",
-    "                # Only apply image features to some layers for a balance\n",
-    "                if i % 2 == 0:  # Apply to every other layer\n",
-    "                    hidden_states = hidden_states + 0.1 * image_features_expanded  # Scale down the influence\n",
-    "                \n",
-    "                # Apply feed-forward network\n",
-    "                residual = hidden_states\n",
-    "                hidden_states = layer.final_layer_norm(hidden_states)\n",
-    "                hidden_states = layer.fc1(hidden_states)\n",
-    "                hidden_states = torch.nn.functional.relu(hidden_states)\n",
-    "                hidden_states = layer.fc2(hidden_states)\n",
-    "                hidden_states = residual + hidden_states\n",
-    "            \n",
-    "            # Forward through final layers\n",
-    "            hidden_states = language_model.model.decoder.final_layer_norm(hidden_states)\n",
-    "            next_token_logits = language_model.lm_head(hidden_states[:, -1, :])\n",
-    "            \n",
-    "            # Sample next token (with temperature)\n",
-    "            next_token_logits = next_token_logits / temperature\n",
-    "            filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=50, top_p=0.9)\n",
-    "            probs = torch.nn.functional.softmax(filtered_logits, dim=-1)\n",
-    "            next_token = torch.multinomial(probs, num_samples=1)\n",
-    "            \n",
-    "            context = torch.cat([context, next_token], dim=1)\n",
-    "            cur_len += 1\n",
-    "            \n",
-    "            # Stop if we generate an EOS token\n",
-    "            if next_token.item() == tokenizer.eos_token_id:\n",
-    "                break\n",
-    "    \n",
-    "    # Decode the generated text\n",
-    "    generated_text = tokenizer.decode(context[0], skip_special_tokens=True)\n",
-    "    return generated_text, projection_layer"
+    "def generate_with_cross_attention(image_features, prompt, max_length=30, existing_projection_layer=None, temperature=0.7):
+        # Tokenize prompt
+        encoded_prompt = tokenizer(prompt, return_tensors=\"pt\").to(device)
+        input_ids = encoded_prompt.input_ids
+        
+        # Get model's hidden dimension
+        hidden_size = language_model.config.hidden_size
+        print(f\"Language model hidden size: {hidden_size}\")
+        print(f\"Image features shape: {image_features.shape}\")
+        
+        # Use the provided projection layer or create a new one
+        if existing_projection_layer is not None and isinstance(existing_projection_layer, torch.nn.Module):
+            if existing_projection_layer.in_features == image_features.shape[-1] and existing_projection_layer.out_features == hidden_size:
+                projection_layer = existing_projection_layer
+                print(\"Using existing projection layer\")
+            else:
+                print(f\"Existing projection layer dimensions don't match: {existing_projection_layer.in_features} -> {existing_projection_layer.out_features}\")
+                print(\"Creating new projection layer\")
+                projection_layer = torch.nn.Linear(image_features.shape[-1], hidden_size).to(device).to(model_dtype)
+                torch.nn.init.normal_(projection_layer.weight, std=0.01)
+                torch.nn.init.zeros_(projection_layer.bias)
+        else:
+            print(\"Creating new projection layer\")
+            projection_layer = torch.nn.Linear(image_features.shape[-1], hidden_size).to(device).to(model_dtype)
+            torch.nn.init.normal_(projection_layer.weight, std=0.01)
+            torch.nn.init.zeros_(projection_layer.bias)
+        
+        # Project image features to match the model's hidden dimension
+        print(f\"Image features dtype before projection: {image_features.dtype}\")
+        print(f\"Projection layer weight dtype: {projection_layer.weight.dtype}\")
+        
+        # Ensure image features have the correct dtype
+        if image_features.dtype != projection_layer.weight.dtype:
+            image_features = image_features.to(projection_layer.weight.dtype)
+            print(f\"Converted image features to {image_features.dtype}\")
+            
+        projected_img_features = projection_layer(image_features)
+        print(f\"Projected features shape: {projected_img_features.shape}\")
+        
+        # Initialize generation
+        cur_len = input_ids.shape[1]
+        context = input_ids.clone()
+        
+        # Generate one token at a time using a simplified approach
+        while cur_len < max_length:
+            with torch.no_grad():
+                # Use a simpler approach - get the embeddings directly
+                outputs = language_model(
+                    input_ids=context
+                )
+                
+                # Get logits from the output
+                next_token_logits = outputs.logits[:, -1, :]
+                
+                # Modify logits based on image features
+                # Convert to same dtype if needed
+                if projected_img_features.dtype != next_token_logits.dtype:
+                    projected_img_features = projected_img_features.to(next_token_logits.dtype)
+                
+                # Scale and add the image features influence through a simple linear projection to the logits space
+                image_logits = torch.matmul(projected_img_features, language_model.lm_head.weight.t())
+                
+                # Combine model logits with image influence
+                combined_logits = next_token_logits + 0.1 * image_logits
+                
+                # Sample next token (with temperature)
+                combined_logits = combined_logits / temperature
+                filtered_logits = top_k_top_p_filtering(combined_logits, top_k=50, top_p=0.9)
+                probs = torch.nn.functional.softmax(filtered_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                context = torch.cat([context, next_token], dim=1)
+                cur_len += 1
+                
+                # Stop if we generate an EOS token
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+        
+        # Decode the generated text
+        generated_text = tokenizer.decode(context[0], skip_special_tokens=True)
+        return generated_text, projection_layer"
    ]
   },
   {
@@ -412,9 +407,15 @@
     "\n",
     "# Check if we already have a projection layer\n",
     "try:\n",
-    "    print(f\"Projection layer exists: in_features={projection_layer.in_features}, out_features={projection_layer.out_features}\")\n",
-    "except NameError:\n",
-    "    print(\"No projection layer exists yet, one will be created\")\n",
+    "    # First check if the variable exists and is not None\n",
+    "    if 'projection_layer' in locals() and projection_layer is not None:\n",
+    "        print(f\"Projection layer exists: in_features={projection_layer.in_features}, out_features={projection_layer.out_features}\")\n",
+    "    else:\n",
+    "        print(\"No projection layer exists yet, one will be created\")\n",
+    "        projection_layer = None\n",
+    "except Exception as e:\n",
+    "    print(f\"Error checking projection layer: {e}\")\n",
+    "    print(\"Creating a new projection layer\")\n",
     "    projection_layer = None\n",
     "\n",
     "# Execute the cross-attention generation\n",
@@ -512,15 +513,17 @@
     "            plt.title(f\"Ground Truth: {dataset[idx]['text']}\")\n",
     "            plt.show()\n",
     "            \n",
-    "            # Preprocess and extract features\n",
-    "            processed_test_image = preprocess_image(test_image).to(device).to(model_dtype)\n",
-    "            \n",
-    "            with torch.no_grad():\n",
-    "                test_features = feature_extractor(processed_test_image)\n",
-    "                test_class_token = test_features[:, 0, :].to(device).to(model_dtype)\n",
-    "            \n",
-    "            # Generate caption with the best prompt\n",
-    "            result, projection_layer = generate_with_cross_attention(\n",
+    "            # Preprocess and extract features
+            processed_test_image = preprocess_image(test_image).to(device)
+            
+            with torch.no_grad():
+                # Convert test image to match model dtype
+                processed_test_image = processed_test_image.to(model_dtype)
+                test_features = feature_extractor(processed_test_image)
+                test_class_token = test_features[:, 0, :].to(device)
+            
+            # Generate caption with the best prompt
+            result, projection_layer = generate_with_cross_attention(\n",
     "                test_class_token,\n",
     "                \"This image shows\",\n",
     "                existing_projection_layer=projection_layer\n",
