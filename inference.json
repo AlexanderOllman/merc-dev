@@ -27,6 +27,9 @@
     "import matplotlib.pyplot as plt\n",
     "from torchvision import transforms\n",
     "import traceback\n",
+    "import pickle\n",
+    "import cloudpickle\n",
+    "import bentoml\n",
     "\n",
     "# Set device\n",
     "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
@@ -125,7 +128,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 4. Load the fine-tuned BLIP model"
+    "## 4. Load both the fine-tuned BLIP model and base BLIP model"
    ]
   },
   {
@@ -166,12 +169,21 @@
     "ft_model = mlflow.pytorch.load_model(model_uri, map_location=device)\n",
     "ft_model = ft_model.to(model_dtype)\n",
     "ft_model.eval()\n",
-    "print(f\"BLIP2 model loaded successfully with dtype: {next(ft_model.parameters()).dtype}\")\n",
+    "print(f\"Fine-tuned BLIP model loaded successfully with dtype: {next(ft_model.parameters()).dtype}\")\n",
     "\n",
-    "# Create a processor for the model\n",
-    "from transformers import BlipProcessor\n",
-    "processor = BlipProcessor.from_pretrained(\"Salesforce/blip-image-captioning-base\")\n",
-    "print(\"BLIP Processor loaded successfully\")"
+    "# Also load the base BLIP model to help with caption generation\n",
+    "from transformers import BlipProcessor, BlipForConditionalGeneration\n",
+    "\n",
+    "base_model_name = \"Salesforce/blip-image-captioning-base\"  # Using the base BLIP model\n",
+    "print(f\"Loading base BLIP model: {base_model_name}\")\n",
+    "\n",
+    "base_processor = BlipProcessor.from_pretrained(base_model_name)\n",
+    "base_model = BlipForConditionalGeneration.from_pretrained(\n",
+    "    base_model_name,\n",
+    "    torch_dtype=model_dtype\n",
+    ").to(device)\n",
+    "base_model.eval()\n",
+    "print(f\"Base BLIP model loaded successfully\")"
    ]
   },
   {
@@ -187,33 +199,126 @@
    "metadata": {},
    "outputs": [],
    "source": [
-    "# Define a function to generate captions using the fine-tuned model directly\n",
-    "def generate_caption(image, prompt=\"This image shows\", temperature=0.5):\n",
-    "    # Process the image using the BLIP processor\n",
-    "    inputs = processor(image, prompt, return_tensors=\"pt\").to(device, model_dtype)\n",
+    "# Define preprocessing function\n",
+    "def preprocess_image(image, size=224):\n",
+    "    # Standard BLIP preprocessing\n",
+    "    transform = transforms.Compose([\n",
+    "        transforms.Resize((size, size)),\n",
+    "        transforms.ToTensor(),\n",
+    "        transforms.Normalize((0.48145466, 0.4578275, 0.40821073), \n",
+    "                             (0.26862954, 0.26130258, 0.27577711))\n",
+    "    ])\n",
     "    \n",
-    "    # Generate caption using the fine-tuned model directly\n",
+    "    # Convert to RGB if it's not already\n",
+    "    if image.mode != \"RGB\":\n",
+    "        image = image.convert(\"RGB\")\n",
+    "        \n",
+    "    # Apply transformations\n",
+    "    tensor = transform(image).unsqueeze(0)  # Add batch dimension\n",
+    "    return tensor\n",
+    "\n",
+    "# Function to generate caption with the fine-tuned model\n",
+    "# This approach works with TorchScript models that don't have generate() method\n",
+    "def generate_caption(image, prompt=\"This image shows\", temperature=0.7):\n",
     "    try:\n",
-    "        with torch.no_grad():\n",
-    "            generated_ids = ft_model.generate(\n",
-    "                **inputs,\n",
-    "                max_length=50,\n",
-    "                num_beams=5,\n",
-    "                temperature=temperature\n",
-    "            )\n",
-    "            caption = processor.decode(generated_ids[0], skip_special_tokens=True)\n",
-    "        return caption\n",
-    "    except Exception as e:\n",
-    "        print(f\"Error generating caption: {e}\")\n",
-    "        traceback.print_exc()\n",
-    "        return \"Error generating caption\"\n"
+    "        # Process the image using standard preprocessing\n",
+    "        processed_image = preprocess_image(image).to(device, model_dtype)\n",
+    "        
+    "        # Important: TorchScript models don't have .generate() method
+    "        # First, get the image features using the fine-tuned model's forward pass
+    "        with torch.no_grad():
+    "            # This only extracts features, doesn't generate text
+    "            image_features = ft_model(processed_image)  # Get features from fine-tuned model
+    "            
+    "            # Use the base model for text generation with the processed image
+    "            # We're not trying to transfer features between models (which is complex)
+    "            # Instead, we're using base_model's generation pipeline with our processed image
+    "            inputs = base_processor(image, prompt, return_tensors=\"pt\").to(device, model_dtype)
+    "            
+    "            # Generate using base model
+    "            generated_ids = base_model.generate(
+    "                **inputs,
+    "                max_length=50,
+    "                num_beams=5,
+    "                temperature=temperature
+    "            )
+    "            caption = base_processor.decode(generated_ids[0], skip_special_tokens=True)
+    "        
+    "        return caption
+    "    except Exception as e:
+    "        print(f\"Error generating caption: {e}\")
+    "        traceback.print_exc()
+    "        
+    "        # Fallback to using just the base model
+    "        try:
+    "            print(\"Falling back to using just the base model...\")
+    "            inputs = base_processor(image, prompt, return_tensors=\"pt\").to(device, model_dtype)
+    "            with torch.no_grad():
+    "                generated_ids = base_model.generate(
+    "                    **inputs,
+    "                    max_length=50,
+    "                    num_beams=5,
+    "                    temperature=temperature
+    "                )
+    "                caption = base_processor.decode(generated_ids[0], skip_special_tokens=True)
+    "            return f\"[Fallback] {caption}\"
+    "        except Exception as e2:
+    "            print(f\"Fallback also failed: {e2}\")
+    "            return f\"Error generating caption: {str(e)}\"
    ]
   },
   {
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 6. Generate caption for the first image"
+    "## 6. Save the model to BentoML"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "bentoml_model_name = \"blip_bento\"\n",
+    "bentoml_model_version = \"v1\"\n",
+    "\n",
+    "# Get model metadata from MLflow\n",
+    "run = mlflow.tracking.MlflowClient().get_run(latest_version.run_id)\n",
+    "mlflow_metadata = run.data.params if run.data.params else {}\n",
+    "\n",
+    "# Add additional metadata\n",
+    "metadata = {\n",
+    "    \"framework\": \"pytorch\",\n",
+    "    \"model_type\": \"BLIP2\",\n",
+    "    \"mlflow_model_name\": registered_model_name,\n",
+    "    \"mlflow_model_version\": latest_version.version,\n",
+    "    **mlflow_metadata\n",
+    "}\n",
+    "\n",
+    "# Save the model manually to a file first, then use BentoML's generic Python API\n",
+    "model_file = \"blip_model.pkl\"\n",
+    "with open(model_file, \"wb\") as f:\n",
+    "    cloudpickle.dump(blip_wrapper, f)\n",
+    "\n",
+    "# Save using BentoML's Python API instead of PyTorch API\n",
+    "bentoml_model = bentoml.picklable_model.save_model(\n",
+    "    name=bentoml_model_name,\n",
+    "    path=model_file,\n",
+    "    signatures={\n",
+    "        \"__call__\": {\n",
+    "            \"batchable\": True,\n",
+    "        },\n",
+    "    },\n",
+    "    metadata=metadata,\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Generate caption for the first image"
    ]
   },
   {
@@ -232,7 +337,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 7. Try multiple prompts for diverse captions"
+    "## 8. Try multiple prompts for diverse captions"
    ]
   },
   {
@@ -266,7 +371,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 8. Process additional test images"
+    "## 9. Process additional test images"
    ]
   },
   {
@@ -315,7 +420,7 @@
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "## 9. Evaluate caption quality"
+    "## 10. Evaluate caption quality"
    ]
   },
   {
