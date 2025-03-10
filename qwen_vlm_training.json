@@ -1,0 +1,587 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Fine-tuning Qwen VLM Model\n",
+    "\n",
+    "This notebook demonstrates how to fine-tune the Qwen VLM model using the Hugging Face TRL (Transformer Reinforcement Learning) library on a dataset of images and text from an S3 bucket.\n",
+    "\n",
+    "## Steps:\n",
+    "1. Set up environment and install dependencies\n",
+    "2. Load the Qwen VLM model and processor\n",
+    "3. Load and prepare the dataset from S3\n",
+    "4. Set up LoRA configuration for efficient fine-tuning\n",
+    "5. Configure the TRL SFTTrainer\n",
+    "6. Train the model\n",
+    "7. Evaluate and save the model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "!nvidia-smi"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Install Dependencies\n",
+    "\n",
+    "First, let's install the necessary libraries."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "!pip install torch torchvision transformers trl peft boto3 pillow accelerate bitsandbytes mlflow"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "import os\n",
+    "import json\n",
+    "import torch\n",
+    "import boto3\n",
+    "import mlflow\n",
+    "import mlflow.pytorch\n",
+    "from botocore.exceptions import NoCredentialsError\n",
+    "from pathlib import Path\n",
+    "from PIL import Image\n",
+    "from torch.utils.data import Dataset, DataLoader\n",
+    "from transformers import (\n",
+    "    AutoModelForVision2Seq,\n",
+    "    AutoProcessor,\n",
+    "    BitsAndBytesConfig,\n",
+    "    TrainingArguments\n",
+    ")\n",
+    "from peft import LoraConfig, get_peft_model\n",
+    "from trl import SFTTrainer"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Configuration\n",
+    "\n",
+    "Set up the configuration for the fine-tuning process."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Configuration\n",
+    "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "model_id = \"Qwen/Qwen2-VL-7B\"  # Can change to other variants like \"Qwen/Qwen2-VL-7B-Instruct\"\n",
+    "batch_size = 8\n",
+    "num_epochs = 10\n",
+    "lr = 1e-5\n",
+    "save_model_path = \"qwen_vlm_finetuned.pt\"\n",
+    "\n",
+    "# For 4-bit quantization to reduce memory usage\n",
+    "use_4bit_quantization = True"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Load the Qwen VLM Model and Processor\n",
+    "\n",
+    "Now, let's load the pre-trained Qwen VLM model and its processor."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "if use_4bit_quantization:\n",
+    "    # BitsAndBytesConfig for 4-bit quantization\n",
+    "    bnb_config = BitsAndBytesConfig(\n",
+    "        load_in_4bit=True,\n",
+    "        bnb_4bit_use_double_quant=True,\n",
+    "        bnb_4bit_quant_type=\"nf4\",\n",
+    "        bnb_4bit_compute_dtype=torch.bfloat16\n",
+    "    )\n",
+    "    \n",
+    "    # Load model with quantization\n",
+    "    model = AutoModelForVision2Seq.from_pretrained(\n",
+    "        model_id,\n",
+    "        device_map=\"auto\",\n",
+    "        torch_dtype=torch.bfloat16,\n",
+    "        quantization_config=bnb_config\n",
+    "    )\n",
+    "else:\n",
+    "    # Load model without quantization\n",
+    "    model = AutoModelForVision2Seq.from_pretrained(\n",
+    "        model_id,\n",
+    "        device_map=\"auto\",\n",
+    "        torch_dtype=torch.bfloat16\n",
+    "    )\n",
+    "\n",
+    "# Load processor\n",
+    "processor = AutoProcessor.from_pretrained(model_id)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Set up S3 Connection\n",
+    "\n",
+    "Connect to the S3 bucket to retrieve the dataset."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "object_storage_service_name = \"source-images-service\"\n",
+    "object_storage_namespace = \".ezdata-system\"\n",
+    "resource_type = \".svc\"\n",
+    "domain = \".cluster.local\"\n",
+    "object_storage_port = \"30000\"\n",
+    "\n",
+    "s3_endpoint_url = f\"http://{object_storage_service_name}{object_storage_namespace}{resource_type}{domain}:{object_storage_port}\"\n",
+    "print(s3_endpoint_url)\n",
+    "\n",
+    "s3_client = boto3.client('s3', endpoint_url=s3_endpoint_url)\n",
+    "s3_resource = boto3.resource('s3', endpoint_url=s3_endpoint_url)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Load Dataset from S3\n",
+    "\n",
+    "Retrieve the dataset from the S3 bucket."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "bucket_name = \"poc-mercedes-gp\"\n",
+    "file_key = \"training/training_dataset.json\"\n",
+    "\n",
+    "response = s3_client.get_object(Bucket=bucket_name, Key=file_key)\n",
+    "content = response[\"Body\"].read().decode(\"utf-8\")\n",
+    "dataset = json.loads(content)\n",
+    "print(f\"Dataset size: {len(dataset)}\")\n",
+    "print(f\"Sample data: {dataset[0]}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Download Images\n",
+    "\n",
+    "Download the images from S3 to local storage."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Create directory for images\n",
+    "Path('training_images').mkdir(exist_ok=True)\n",
+    "checked_dataset = []\n",
+    "\n",
+    "for item in dataset:\n",
+    "    try:\n",
+    "        s3_client.download_file(bucket_name, item['s3_key'], f'training_images/{item[\"s3_key\"].split(\"/\")[-1]}')\n",
+    "        checked_dataset.append(item)\n",
+    "    except Exception as e:\n",
+    "        print(f'Exception {e} for {item[\"s3_key\"]}')\n",
+    "\n",
+    "print(f\"Downloaded {len(checked_dataset)} images successfully\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Create Custom Dataset Class for Qwen VLM\n",
+    "\n",
+    "Define a custom dataset class that works with the Qwen VLM model."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "class QwenVLMDataset(Dataset):\n",
+    "    def __init__(self, data, processor):\n",
+    "        self.data = data\n",
+    "        self.processor = processor\n",
+    "    \n",
+    "    def __len__(self):\n",
+    "        return len(self.data)\n",
+    "    \n",
+    "    def __getitem__(self, idx):\n",
+    "        item = self.data[idx]\n",
+    "        image_path = os.path.join('training_images', item[\"s3_key\"].split('/')[-1])\n",
+    "        text = item[\"text\"]\n",
+    "        \n",
+    "        # Open image\n",
+    "        image = Image.open(image_path).convert(\"RGB\")\n",
+    "        \n",
+    "        # Format in conversation style for Qwen VLM\n",
+    "        # Format depends on whether we're using the base or instruct model\n",
+    "        if \"Instruct\" in model_id:\n",
+    "            # For Qwen*-Instruct models\n",
+    "            messages = [\n",
+    "                {\"role\": \"user\", \"content\": [{'type': 'image', 'image': image}, {'type': 'text', 'text': \"What's in this image?\"}]},\n",
+    "                {\"role\": \"assistant\", \"content\": text}\n",
+    "            ]\n",
+    "            inputs = self.processor(messages=messages, return_tensors=\"pt\")\n",
+    "        else:\n",
+    "            # For base Qwen models\n",
+    "            inputs = self.processor(text=[\"Describe this image: \"], images=image, return_tensors=\"pt\")\n",
+    "            inputs[\"labels\"] = self.processor.tokenizer(text, return_tensors=\"pt\")[\"input_ids\"]\n",
+    "        \n",
+    "        # Remove batch dimension\n",
+    "        for k, v in inputs.items():\n",
+    "            if isinstance(v, torch.Tensor):\n",
+    "                inputs[k] = v.squeeze(0)\n",
+    "        \n",
+    "        return inputs"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Prepare Datasets and DataLoaders\n",
+    "\n",
+    "Split the dataset into training and validation sets and create DataLoaders."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Split dataset\n",
+    "train_data = checked_dataset[:int(0.8 * len(checked_dataset))]\n",
+    "val_data = checked_dataset[int(0.8 * len(checked_dataset)):]\n",
+    "\n",
+    "print(f\"Training data size: {len(train_data)}\")\n",
+    "print(f\"Validation data size: {len(val_data)}\")\n",
+    "\n",
+    "# Create datasets\n",
+    "train_dataset = QwenVLMDataset(train_data, processor)\n",
+    "val_dataset = QwenVLMDataset(val_data, processor)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9. Set up LoRA Configuration\n",
+    "\n",
+    "Configure Parameter-Efficient Fine-Tuning (PEFT) with LoRA."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# LoRA configuration\n",
+    "peft_config = LoraConfig(\n",
+    "    lora_alpha=16,\n",
+    "    lora_dropout=0.05,\n",
+    "    r=8,\n",
+    "    bias=\"none\",\n",
+    "    target_modules=[\"q_proj\", \"v_proj\"],\n",
+    "    task_type=\"CAUSAL_LM\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 10. Set up MLflow for Tracking\n",
+    "\n",
+    "Configure MLflow to track the training process."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "def get_token():\n",
+    "    TOKEN_PATH = '/etc/secrets/ezua/.auth_token'\n",
+    "    with open(TOKEN_PATH, 'r') as f:\n",
+    "        auth_token = f.read()\n",
+    "\n",
+    "    os.environ['MLFLOW_TRACKING_TOKEN'] = auth_token\n",
+    "    os.environ['AUTH_TOKEN'] = auth_token\n",
+    "    return auth_token\n",
+    "\n",
+    "token = get_token()\n",
+    "\n",
+    "os.environ['MLFLOW_TRACKING_URI'] = 'http://mlflow.mlflow.svc.cluster.local:5000'\n",
+    "os.environ['MLFLOW_S3_ENDPOINT_URL'] = 'http://local-s3-service.ezdata-system.svc.cluster.local:30000'\n",
+    "os.environ['MLFLOW_S3_IGNORE_TLS'] = 'true'\n",
+    "os.environ['MLFLOW_TRACKING_INSECURE_TLS'] = 'true'\n",
+    "os.environ['MLFLOW_TRACKING_TOKEN'] = token\n",
+    "os.environ['AUTH_TOKEN'] = token\n",
+    "\n",
+    "mlflow.set_tracking_uri(os.environ[\"MLFLOW_TRACKING_URI\"])\n",
+    "\n",
+    "# Set MLflow experiment\n",
+    "mlflow.set_experiment(\"Qwen VLM Fine-tuning\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Setup token refresh mechanism to avoid token expiration during training\n",
+    "import threading\n",
+    "import time\n",
+    "\n",
+    "def refresh_token():\n",
+    "    secret_file_path = \"/etc/secrets/ezua/.auth_token\"\n",
+    "\n",
+    "    with open(secret_file_path, \"r\") as file:\n",
+    "        token = file.read().strip()\n",
+    "    os.environ['MLFLOW_TRACKING_TOKEN'] = token\n",
+    "    print('token refreshed')\n",
+    "\n",
+    "def start_timer(interval=900):  # 900 seconds = 15 minutes\n",
+    "    def loop():\n",
+    "        while True:\n",
+    "            refresh_token()\n",
+    "            time.sleep(interval)\n",
+    "\n",
+    "    thread = threading.Thread(target=loop, daemon=True)\n",
+    "    thread.start()\n",
+    "\n",
+    "start_timer()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 11. Set up Training Arguments\n",
+    "\n",
+    "Configure the training arguments for the SFTTrainer."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Define training arguments\n",
+    "training_args = TrainingArguments(\n",
+    "    output_dir=\"qwen_vlm_finetuned\",\n",
+    "    num_train_epochs=num_epochs,\n",
+    "    per_device_train_batch_size=batch_size,\n",
+    "    per_device_eval_batch_size=batch_size,\n",
+    "    gradient_accumulation_steps=2,\n",
+    "    evaluation_strategy=\"steps\",\n",
+    "    eval_steps=50,\n",
+    "    logging_dir=\"logs\",\n",
+    "    logging_steps=10,\n",
+    "    save_strategy=\"steps\",\n",
+    "    save_steps=50,\n",
+    "    learning_rate=lr,\n",
+    "    weight_decay=0.01,\n",
+    "    fp16=True,\n",
+    "    push_to_hub=False,\n",
+    "    report_to=\"mlflow\",\n",
+    "    remove_unused_columns=False,  # Important for custom datasets\n",
+    "    gradient_checkpointing=True,  # To save memory\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 12. Create and Configure the SFTTrainer\n",
+    "\n",
+    "Set up the SFTTrainer with our model, datasets, and training configuration."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Create the trainer\n",
+    "trainer = SFTTrainer(\n",
+    "    model=model,\n",
+    "    args=training_args,\n",
+    "    train_dataset=train_dataset,\n",
+    "    eval_dataset=val_dataset,\n",
+    "    peft_config=peft_config,\n",
+    "    dataset_text_field=None,  # We're handling texts in our custom dataset class\n",
+    "    max_seq_length=512,\n",
+    "    tokenizer=processor.tokenizer,\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 13. Train the Model\n",
+    "\n",
+    "Start the training process."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "with mlflow.start_run(run_name=\"qwen_vlm_training\"):\n",
+    "    # Log parameters\n",
+    "    mlflow.log_param(\"model_id\", model_id)\n",
+    "    mlflow.log_param(\"batch_size\", batch_size)\n",
+    "    mlflow.log_param(\"num_epochs\", num_epochs)\n",
+    "    mlflow.log_param(\"learning_rate\", lr)\n",
+    "    mlflow.log_param(\"peft_r\", peft_config.r)\n",
+    "    mlflow.log_param(\"peft_lora_alpha\", peft_config.lora_alpha)\n",
+    "    mlflow.log_param(\"dataset_size\", len(checked_dataset))\n",
+    "    \n",
+    "    # Train the model\n",
+    "    trainer.train()\n",
+    "    \n",
+    "    # Save the final model\n",
+    "    trainer.save_model(\"qwen_vlm_finetuned_final\")\n",
+    "    \n",
+    "    # Log the model to MLflow\n",
+    "    mlflow.pytorch.log_model(trainer.model, \"qwen_vlm_model\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 14. Test the Fine-tuned Model\n",
+    "\n",
+    "Evaluate the fine-tuned model on some test examples."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Load a test image\n",
+    "test_image_path = f'training_images/{val_data[0][\"s3_key\"].split(\"/\")[-1]}'\n",
+    "test_image = Image.open(test_image_path).convert(\"RGB\")\n",
+    "\n",
+    "# Display the image\n",
+    "from IPython.display import display\n",
+    "display(test_image)\n",
+    "\n",
+    "# Ground truth\n",
+    "print(f\"Ground truth: {val_data[0]['text']}\")\n",
+    "\n",
+    "# Prepare inputs\n",
+    "if \"Instruct\" in model_id:\n",
+    "    messages = [\n",
+    "        {\"role\": \"user\", \"content\": [{'type': 'image', 'image': test_image}, {'type': 'text', 'text': \"What's in this image?\"}]}\n",
+    "    ]\n",
+    "    inputs = processor(messages=messages, return_tensors=\"pt\").to(device)\n",
+    "else:\n",
+    "    inputs = processor(text=[\"Describe this image: \"], images=test_image, return_tensors=\"pt\").to(device)\n",
+    "\n",
+    "# Generate response\n",
+    "with torch.no_grad():\n",
+    "    outputs = model.generate(\n",
+    "        **inputs,\n",
+    "        max_new_tokens=100,\n",
+    "        do_sample=True,\n",
+    "        temperature=0.7,\n",
+    "        top_p=0.9,\n",
+    "    )\n",
+    "\n",
+    "# Decode and print the output\n",
+    "generated_text = processor.tokenizer.decode(outputs[0], skip_special_tokens=True)\n",
+    "print(f\"Model output: {generated_text}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 15. Save the Fine-tuned Model for Deployment\n",
+    "\n",
+    "Save the fine-tuned model for future use."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Save the final model to S3\n",
+    "try:\n",
+    "    # Create a compressed archive of the model\n",
+    "    !tar -czvf qwen_vlm_finetuned.tar.gz qwen_vlm_finetuned_final\n",
+    "    \n",
+    "    # Upload to S3\n",
+    "    s3_client.upload_file(\n",
+    "        \"qwen_vlm_finetuned.tar.gz\", \n",
+    "        bucket_name, \n",
+    "        \"models/qwen_vlm_finetuned.tar.gz\"\n",
+    "    )\n",
+    "    print(\"Model successfully saved to S3\")\n",
+    "except Exception as e:\n",
+    "    print(f\"Error saving model to S3: {e}\")\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.9"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+} 
